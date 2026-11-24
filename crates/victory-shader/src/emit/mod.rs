@@ -91,6 +91,8 @@ pub mod host;
 mod lower;
 mod own_bits;
 mod rect;
+#[cfg(test)]
+mod salu_tests;
 mod sampler;
 mod shader;
 mod threading;
