@@ -127,6 +127,11 @@ pub(super) const fn vop2(op: u16, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
+/// VOPC `op src0, vsrc1`, which writes a lane mask.
+pub(super) const fn vopc(op: u16, src0: u16, vsrc1: u8) -> u32 {
+    0x7C00_0000 | (op as u32 & 0xFF) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
 pub(super) const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
