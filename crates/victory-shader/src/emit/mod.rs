@@ -96,6 +96,8 @@ mod salu_tests;
 #[cfg(test)]
 mod synth;
 #[cfg(test)]
+mod valu16_int_tests;
+#[cfg(test)]
 mod valu_int_tests;
 mod sampler;
 mod shader;

@@ -7867,9 +7867,19 @@ impl<'a> Lower<'a> {
         ];
         const INT: &[&str] = &[
             "v_add_nc_u16",
+            "v_add_nc_i16",
             "v_sub_nc_u16",
+            "v_sub_nc_i16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
+            "v_mad_u16",
+            "v_mad_i16",
+            "v_min3_u16",
+            "v_min3_i16",
+            "v_max3_u16",
+            "v_max3_i16",
+            "v_med3_u16",
+            "v_med3_i16",
             "v_lshlrev_b16",
             "v_lshrrev_b16",
             "v_ashrrev_i16",
@@ -8066,8 +8076,25 @@ impl<'a> Lower<'a> {
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
+        // The three-source forms: a multiply-add, and the three-way
+        // minimum, maximum and median.
+        const INT3: &[&str] = &[
+            "v_mad_u16",
+            "v_mad_i16",
+            "v_min3_u16",
+            "v_min3_i16",
+            "v_max3_u16",
+            "v_max3_i16",
+            "v_med3_u16",
+            "v_med3_i16",
+        ];
         let r = {
             let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let mut third = if INT3.contains(&name) {
+                Some(self.half_src(inst, 2)?)
+            } else {
+                None
+            };
             let k16 = self.s.m.i32(16);
             let sext = |l: &mut Self, x: V| {
                 let t = l.s.m.bin(c, Bin::Shl, x, k16);
@@ -8076,13 +8103,48 @@ impl<'a> Lower<'a> {
             if name.ends_with("_i16") {
                 a = sext(self, a);
                 b = sext(self, b);
+                third = third.map(|x| sext(self, x));
             }
             let k15 = self.s.m.i32(15);
             match name {
-                "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                "v_add_nc_u16" | "v_add_nc_i16" => self.s.m.bin(c, Bin::Add, a, b),
+                "v_sub_nc_u16" | "v_sub_nc_i16" => self.s.m.bin(c, Bin::Sub, a, b),
                 "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                 "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                _ if INT3.contains(&name) => {
+                    let d = third.ok_or("a missing operand")?;
+                    if name.starts_with("v_mad") {
+                        let t = self.s.m.bin(c, Bin::Mul, a, b);
+                        self.s.m.bin(c, Bin::Add, t, d)
+                    } else {
+                        let signed = name.ends_with("_i16");
+                        let (lt, gt) = if signed {
+                            (pred::SLT, pred::SGT)
+                        } else {
+                            (pred::IULT, pred::IUGT)
+                        };
+                        let pick = |l: &mut Self, p, x, y| {
+                            let t = l.s.m.cmp(c, p, x, y);
+                            l.s.m.select(c, t, x, y)
+                        };
+                        match &name[2..6] {
+                            "min3" => {
+                                let t = pick(self, lt, a, b);
+                                pick(self, lt, t, d)
+                            }
+                            "max3" => {
+                                let t = pick(self, gt, a, b);
+                                pick(self, gt, t, d)
+                            }
+                            _ => {
+                                let lo = pick(self, lt, a, b);
+                                let hi = pick(self, gt, a, b);
+                                let t = pick(self, lt, hi, d);
+                                pick(self, gt, lo, t)
+                            }
+                        }
+                    }
+                }
                 "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
                     // src0 is the shift (4 bits), src1 the value.
                     let sh = self.s.m.bin(c, Bin::And, a, k15);
@@ -8443,6 +8505,21 @@ impl<'a> Lower<'a> {
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 self.mul_hi(a, b, name == "v_mul_hi_i32")
+            }
+            "v_mad_i32_i16" | "v_mad_u32_u16" => {
+                // 16-bit sources, a 32-bit product and addend.
+                let signed = name == "v_mad_i32_i16";
+                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                if signed {
+                    let k16 = k(self, 16);
+                    for x in [&mut a, &mut b] {
+                        let t = self.s.m.bin(c, Bin::Shl, *x, k16);
+                        *x = self.s.m.bin(c, Bin::AShr, t, k16);
+                    }
+                }
+                let d = s(self, 2)?;
+                let t = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, t, d)
             }
             "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
                 // Bits 47:32 of the product of two 24-bit numbers.
