@@ -93,6 +93,10 @@ mod own_bits;
 mod rect;
 #[cfg(test)]
 mod salu_tests;
+#[cfg(test)]
+mod synth;
+#[cfg(test)]
+mod valu_int_tests;
 mod sampler;
 mod shader;
 mod threading;
