@@ -3365,6 +3365,40 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, x, up)
     }
 
+    /// `|a - b|`, the operands unsigned.
+    fn abs_diff(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let bigger = self.s.m.cmp(c, pred::IUGT, a, b);
+        let up = self.s.m.bin(c, Bin::Sub, a, b);
+        let down = self.s.m.bin(c, Bin::Sub, b, a);
+        self.s.m.select(c, bigger, up, down)
+    }
+
+    /// `x` held between `lo` and `hi`, compared signed or unsigned, as the
+    /// saturating converts do it.
+    fn clamp_int(&mut self, x: V, lo: u32, hi: u32, signed: bool) -> V {
+        let c = self.cur;
+        let (lo_v, hi_v) = (self.s.m.i32(lo), self.s.m.i32(hi));
+        let (over, under) = if signed {
+            (pred::SGT, pred::SLT)
+        } else {
+            (pred::IUGT, pred::IULT)
+        };
+        let too_big = self.s.m.cmp(c, over, x, hi_v);
+        let t = self.s.m.select(c, too_big, hi_v, x);
+        let too_small = self.s.m.cmp(c, under, t, lo_v);
+        self.s.m.select(c, too_small, lo_v, t)
+    }
+
+    /// Field `i` of `x`, `bits` wide, as an unsigned number.
+    fn field(&mut self, x: V, i: u32, bits: u32) -> V {
+        let c = self.cur;
+        let sh = self.s.m.i32(i * bits);
+        let shifted = self.s.m.bin(c, Bin::LShr, x, sh);
+        let mask = self.s.m.i32((1u32 << bits) - 1);
+        self.s.m.bin(c, Bin::And, shifted, mask)
+    }
+
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
     /// drivers (such as NVIDIA) do not fold `fcmp uno` away under fast-math.
     fn is_nan_f32(&mut self, f: V) -> V {
@@ -8298,14 +8332,16 @@ impl<'a> Lower<'a> {
         };
         Ok(match name {
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            | "v_subrev_nc_u32" | "v_mul_lo_u32" | "v_add_nc_i32" | "v_sub_nc_i32"
+            | "v_mul_lo_i32" => {
+                // The signed spellings are the same bits as the unsigned.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
+                    "v_add_nc_u32" | "v_add_nc_i32" => (Bin::Add, a, b),
+                    "v_sub_nc_u32" | "v_sub_nc_i32" => (Bin::Sub, a, b),
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
@@ -8407,6 +8443,103 @@ impl<'a> Lower<'a> {
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 self.mul_hi(a, b, name == "v_mul_hi_i32")
+            }
+            "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
+                // Bits 47:32 of the product of two 24-bit numbers.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_mul_hi_i32_i24";
+                let sh = k(self, 8);
+                let narrow = if signed { Bin::AShr } else { Bin::LShr };
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, narrow, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, narrow, b, sh);
+                self.mul_hi(a, b, signed)
+            }
+            "v_sad_u32" => {
+                let (a, b, cin) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let d = self.abs_diff(a, b);
+                self.s.m.bin(c, Bin::Add, d, cin)
+            }
+            "v_sad_u8" | "v_sad_hi_u8" | "v_msad_u8" | "v_sad_u16" => {
+                // The distances between the fields of the two sources,
+                // added up and added to the third. The masked form skips a
+                // field whose reference is zero; the high form puts the sum
+                // in the upper half.
+                let (a, b, cin) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (bits, count) = if name == "v_sad_u16" { (16, 2) } else { (8, 4) };
+                let mut sum = k(self, 0);
+                for i in 0..count {
+                    let x = self.field(a, i, bits);
+                    let y = self.field(b, i, bits);
+                    let mut d = self.abs_diff(x, y);
+                    if name == "v_msad_u8" {
+                        let zero = k(self, 0);
+                        let skip = self.s.m.cmp(c, pred::EQ, y, zero);
+                        d = self.s.m.select(c, skip, zero, d);
+                    }
+                    sum = self.s.m.bin(c, Bin::Add, sum, d);
+                }
+                if name == "v_sad_hi_u8" {
+                    let k16 = k(self, 16);
+                    sum = self.s.m.bin(c, Bin::Shl, sum, k16);
+                }
+                self.s.m.bin(c, Bin::Add, sum, cin)
+            }
+            "v_lerp_u8" => {
+                // Each byte the average of the two sources' bytes, rounded
+                // up when the third source's byte is odd.
+                let (a, b, round) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let mut out = k(self, 0);
+                for i in 0..4u32 {
+                    let x = self.field(a, i, 8);
+                    let y = self.field(b, i, 8);
+                    let r = self.field(round, i, 8);
+                    let one = k(self, 1);
+                    let r = self.s.m.bin(c, Bin::And, r, one);
+                    let t = self.s.m.bin(c, Bin::Add, x, y);
+                    let t = self.s.m.bin(c, Bin::Add, t, r);
+                    let t = self.s.m.bin(c, Bin::LShr, t, one);
+                    let sh = k(self, 8 * i);
+                    let t = self.s.m.bin(c, Bin::Shl, t, sh);
+                    out = self.s.m.bin(c, Bin::Or, out, t);
+                }
+                out
+            }
+            "v_cvt_pk_i16_i32" | "v_cvt_pk_u16_u32" => {
+                // Both sources held inside 16 bits, src0 low, src1 high.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_cvt_pk_i16_i32";
+                let (lo_b, hi_b) = if signed {
+                    (0xFFFF_8000, 0x7FFF)
+                } else {
+                    (0, 0xFFFF)
+                };
+                let a = self.clamp_int(a, lo_b, hi_b, signed);
+                let b = self.clamp_int(b, lo_b, hi_b, signed);
+                let low = k(self, 0xFFFF);
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = self.s.m.bin(c, Bin::And, b, low);
+                let k16 = k(self, 16);
+                let b = self.s.m.bin(c, Bin::Shl, b, k16);
+                self.s.m.bin(c, Bin::Or, a, b)
+            }
+            "v_sat_pk_u8_i16" => {
+                // The source's two signed halves held inside a byte each,
+                // packed into the low half of the result.
+                let a = s(self, 0)?;
+                let mut out = k(self, 0);
+                for i in 0..2u32 {
+                    let h = self.field(a, i, 16);
+                    let k16 = k(self, 16);
+                    let h = self.s.m.bin(c, Bin::Shl, h, k16);
+                    let h = self.s.m.bin(c, Bin::AShr, h, k16);
+                    let h = self.clamp_int(h, 0, 0xFF, true);
+                    let sh = k(self, 8 * i);
+                    let h = self.s.m.bin(c, Bin::Shl, h, sh);
+                    out = self.s.m.bin(c, Bin::Or, out, h);
+                }
+                out
             }
             "v_alignbit_b32" | "v_alignbyte_b32" => {
                 // The low dword of {a, b} >> shift.
