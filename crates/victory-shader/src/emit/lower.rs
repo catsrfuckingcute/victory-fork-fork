@@ -3285,6 +3285,86 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, keep, r, t)
     }
 
+    /// A 64-bit field extract: `off` bits in, `width` bits wide, as
+    /// `s_bfe_u64`/`s_bfe_i64` take them. A width of 64 or more keeps
+    /// everything above the offset; a width of 0 gives 0.
+    fn bfe64(&mut self, x: V, off: V, width: V, signed: bool) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let (k63, k64) = (self.s.m.i32(63), self.s.m.i32(64));
+        let off = self.s.m.bin(c, Bin::And, off, k63);
+        let off = self.s.m.cast(c, Cast::ZExt, off, i64t);
+        let shift = if signed { Bin::AShr } else { Bin::LShr };
+        let shifted = self.s.m.bin(c, shift, x, off);
+        let full = self.s.m.cmp(c, pred::IUGE, width, k64);
+        let w = self.s.m.bin(c, Bin::And, width, k63);
+        let w64 = self.s.m.cast(c, Cast::ZExt, w, i64t);
+        let one = self.s.m.int_const(i64t, 1);
+        let ones = self.s.m.int_const(i64t, -1);
+        let mask = self.s.m.bin(c, Bin::Shl, one, w64);
+        let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+        let mask = self.s.m.select(c, full, ones, mask);
+        let r = self.s.m.bin(c, Bin::And, shifted, mask);
+        if !signed {
+            return r;
+        }
+        // Sign-extend a field narrower than 64 bits (none for width 0).
+        let left = self.s.m.bin(c, Bin::Sub, k64, w);
+        let left = self.s.m.bin(c, Bin::And, left, k63);
+        let left = self.s.m.cast(c, Cast::ZExt, left, i64t);
+        let t = self.s.m.bin(c, Bin::Shl, r, left);
+        let t = self.s.m.bin(c, Bin::AShr, t, left);
+        let zero = self.s.m.i32(0);
+        let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
+        let keep = self.s.m.bin(c, Bin::Or, full, is0);
+        self.s.m.select(c, keep, r, t)
+    }
+
+    /// For each four-bit group of `a`, whether any of its bits is set: as
+    /// one bit at `base + group` (`s_quadmask`), or as the group's own four
+    /// bits (`s_wqm`).
+    fn nibbles(&mut self, a: V, wqm: bool, base: u32) -> V {
+        let c = self.cur;
+        let (zero, k15) = (self.s.m.i32(0), self.s.m.i32(0xF));
+        let mut acc = zero;
+        for g in 0..8u32 {
+            let sh = self.s.m.i32(4 * g);
+            let nib = self.s.m.bin(c, Bin::LShr, a, sh);
+            let nib = self.s.m.bin(c, Bin::And, nib, k15);
+            let any = self.s.m.cmp(c, pred::NE, nib, zero);
+            let set = self.s.m.i32(if wqm { 0xF << (4 * g) } else { 1 << (base + g) });
+            let part = self.s.m.select(c, any, set, zero);
+            acc = self.s.m.bin(c, Bin::Or, acc, part);
+        }
+        acc
+    }
+
+    /// Each of the 16 bits of `a` from bit `from` upwards, twice over: bit
+    /// `i` lands in bits `2i` and `2i + 1` (`s_bitreplicate_b64_b32`).
+    fn replicate_bits(&mut self, a: V, from: u32) -> V {
+        let c = self.cur;
+        let sh = self.s.m.i32(from);
+        let mut x = self.s.m.bin(c, Bin::LShr, a, sh);
+        let low = self.s.m.i32(0xFFFF);
+        x = self.s.m.bin(c, Bin::And, x, low);
+        for (step, keep) in [
+            (8u32, 0x00FF_00FFu32),
+            (4, 0x0F0F_0F0F),
+            (2, 0x3333_3333),
+            (1, 0x5555_5555),
+        ] {
+            let n = self.s.m.i32(step);
+            let up = self.s.m.bin(c, Bin::Shl, x, n);
+            let t = self.s.m.bin(c, Bin::Or, x, up);
+            let k = self.s.m.i32(keep);
+            x = self.s.m.bin(c, Bin::And, t, k);
+        }
+        let one = self.s.m.i32(1);
+        let up = self.s.m.bin(c, Bin::Shl, x, one);
+        self.s.m.bin(c, Bin::Or, x, up)
+    }
+
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
     /// drivers (such as NVIDIA) do not fold `fcmp uno` away under fast-math.
     fn is_nan_f32(&mut self, f: V) -> V {
@@ -4923,7 +5003,12 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        // The 64-bit forms by their suffix, plus the one whose destination
+        // is wider than the source its name ends with.
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -5047,6 +5132,186 @@ impl<'a> Lower<'a> {
                         let r = self.s.m.select(c, cond, a, b);
                         self.set(v, Val::I32(r));
                     }
+                    Ok(())
+                }
+                "s_cmov_b64" => {
+                    // Keeps the destination's old value when SCC is clear.
+                    let cond = self.scc_in(inst)?;
+                    let code = dst_code.ok_or("a missing operand")?;
+                    for (h, v) in [(0u8, lo), (1, hi)] {
+                        let old = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                        let old = self.i32_of(old)?;
+                        let a = half(self, 0, h)?;
+                        let r = self.s.m.select(c, cond, a, old);
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    // The dwords swap as their bits reverse.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ra = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                    let rb = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                    self.set(lo, Val::I32(rb));
+                    self.set(hi, Val::I32(ra));
+                    Ok(())
+                }
+                "s_bcnt0_i32_b64" => {
+                    // The zero bits of both dwords, by counting the set bits
+                    // of their complements.
+                    let ones = self.s.m.i32(u32::MAX);
+                    let i32t = self.s.t.i32;
+                    let mut counts = Vec::new();
+                    for h in 0..2u8 {
+                        let a = half(self, 0, h)?;
+                        let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        counts.push(self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]));
+                    }
+                    let r = self.s.m.bin(c, Bin::Add, counts[0], counts[1]);
+                    self.set(lo, Val::I32(r));
+                    let z = self.s.m.i32(0);
+                    let sc = self.s.m.cmp(c, pred::NE, r, z);
+                    self.set(scc, Val::Bit(sc));
+                    Ok(())
+                }
+                "s_ff0_i32_b64" => {
+                    // The lowest zero bit; -1 for none. The complement's
+                    // lowest set bit, the low dword first.
+                    let ones = self.s.m.i32(u32::MAX);
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                    let b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    let i32t = self.s.t.i32;
+                    let fa = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
+                    let fb = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, b, z);
+                    let fb = self.s.m.select(c, none, fb, fb32);
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let r = self.s.m.select(c, low, fa, fb);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_flbit_i32_b64" => {
+                    // The first bit from the top, -1 for none: the high
+                    // dword's count, else 32 plus the low dword's.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let fa = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let fb = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let minus1 = self.s.m.i32(u32::MAX);
+                    let fa32 = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let empty = self.s.m.cmp(c, pred::EQ, a, z);
+                    let lower = self.s.m.select(c, empty, minus1, fa32);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, high, fb, lower);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    // Sets (clears) bit src0[5:0] of the destination it reads.
+                    let code = dst_code.ok_or("a missing operand")?;
+                    let a = src32(self, 0)?;
+                    let (k31, k32, one, z) = (
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(1),
+                        self.s.m.i32(0),
+                    );
+                    let idx = self.s.m.bin(c, Bin::And, a, k31);
+                    let bit = self.s.m.bin(c, Bin::Shl, one, idx);
+                    let upper = self.s.m.bin(c, Bin::And, a, k32);
+                    let upper = self.s.m.cmp(c, pred::NE, upper, z);
+                    let t = self.s.m.bool(true);
+                    for (h, v) in [(0u8, lo), (1, hi)] {
+                        let old = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                        let old = self.i32_of(old)?;
+                        let mine = if h == 0 {
+                            self.s.m.bin(c, Bin::Xor, upper, t)
+                        } else {
+                            upper
+                        };
+                        let here = self.s.m.select(c, mine, bit, z);
+                        let r = if name == "s_bitset1_b64" {
+                            self.s.m.bin(c, Bin::Or, old, here)
+                        } else {
+                            let ones = self.s.m.i32(u32::MAX);
+                            let nb = self.s.m.bin(c, Bin::Xor, here, ones);
+                            self.s.m.bin(c, Bin::And, old, nb)
+                        };
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // src1[5:0] zeros below a field of src0[5:0] ones.
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let k63 = self.s.m.i32(63);
+                    let w = self.s.m.bin(c, Bin::And, a, k63);
+                    let sh = self.s.m.bin(c, Bin::And, b, k63);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let w = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                    let sh = self.s.m.cast(c, Cast::ZExt, sh, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, w);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let x = self.s.m.bin(c, Bin::Shl, m, sh);
+                    let (rl, rh) = self.split64(x);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
+                "s_bfe_u64" | "s_bfe_i64" => {
+                    // src1: offset in bits 0-5, width in bits 16-22.
+                    let (al, ah) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let b = src32(self, 1)?;
+                    let x = self.join64(al, ah);
+                    let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
+                    let w = self.s.m.bin(c, Bin::LShr, b, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    let r = self.bfe64(x, b, w, name == "s_bfe_i64");
+                    let (rl, rh) = self.split64(r);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let sc = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(sc));
+                    Ok(())
+                }
+                "s_quadmask_b64" => {
+                    // One bit per four, the 16 of them in the low dword.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let la = self.nibbles(a, false, 0);
+                    let lb = self.nibbles(b, false, 8);
+                    let r = self.s.m.bin(c, Bin::Or, la, lb);
+                    let z = self.s.m.i32(0);
+                    self.set(lo, Val::I32(r));
+                    self.set(hi, Val::I32(z));
+                    let sc = self.s.m.cmp(c, pred::NE, r, z);
+                    self.set(scc, Val::Bit(sc));
+                    Ok(())
+                }
+                "s_wqm_b64" => {
+                    // Every four bits holding one set bit become four.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let ra = self.nibbles(a, true, 0);
+                    let rb = self.nibbles(b, true, 0);
+                    self.set(lo, Val::I32(ra));
+                    self.set(hi, Val::I32(rb));
+                    let sc = nonzero(self, ra, rb);
+                    self.set(scc, Val::Bit(sc));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    // Each bit of src0 twice over, bit i in bits 2i and 2i+1.
+                    let a = src32(self, 0)?;
+                    let rl = self.replicate_bits(a, 0);
+                    let rh = self.replicate_bits(a, 16);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
                     Ok(())
                 }
                 _ => Err(name),
@@ -5218,6 +5483,61 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, one, a);
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 (self.s.m.bin(c, Bin::Shl, m, b), None)
+            }
+            "s_absdiff_i32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let z = self.s.m.i32(0);
+                let neg = self.s.m.cmp(c, pred::SLT, d, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, d);
+                (self.s.m.select(c, neg, n, d), None)
+            }
+            "s_cmov_b32" => {
+                // Keeps the destination's old value when SCC is clear.
+                let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                let cond = self.scc_in(inst)?;
+                let a = src32(self, 0)?;
+                (self.s.m.select(c, cond, a, old), None)
+            }
+            "s_bcnt0_i32_b32" | "s_ff0_i32_b32" => {
+                // The zero bits counted, or the lowest of them (-1 for
+                // none): the set bits of the complement.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // The low half from src0, the high half from src1, each the
+                // half of its source the name gives.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let first = if name.starts_with("s_pack_hh") {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low)
+                };
+                let second = if name.starts_with("s_pack_ll") {
+                    self.s.m.bin(c, Bin::And, b, low)
+                } else {
+                    self.s.m.bin(c, Bin::LShr, b, k16)
+                };
+                let second = self.s.m.bin(c, Bin::Shl, second, k16);
+                (self.s.m.bin(c, Bin::Or, first, second), None)
+            }
+            "s_quadmask_b32" | "s_wqm_b32" => {
+                let a = src32(self, 0)?;
+                (self.nibbles(a, name == "s_wqm_b32", 0), None)
             }
             _ => return Err(name),
         };
