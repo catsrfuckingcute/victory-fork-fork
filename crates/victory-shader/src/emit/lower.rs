@@ -4089,7 +4089,15 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes);
+        if self.s.threads.is_some() && !self.console_lanes {
+            // A compute program reads other lanes only once its threads are
+            // relabelled so that a host lane is its console lane, which the
+            // scan above decides from the instructions it finds. It does not
+            // see every path that gets here -- a select on a mask the code
+            // holds as a number, say -- so refuse rather than read the lanes
+            // the host happens to give.
+            return Err("a cross-lane operation without console lanes");
+        }
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
@@ -11533,6 +11541,52 @@ mod tests {
             let words = [word, 0x0201_0100, S_ENDPGM];
             assert!(lowers(&words, 0).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_select_on_an_unrecognised_mask_is_refused() {
+        // `v_cndmask_b32` whose mask is an SGPR the structure pass did not
+        // recognise takes the lowering's "mask held as a number" path,
+        // which reads this lane's bit of it and so needs console lanes.
+        // `reads_mask_as_data` leaves `v_cndmask_b32` out of the scan that
+        // sets them (there the mask is a mask, not data), and
+        // `lane_constant_masks` does not follow a mask only a select reads,
+        // as its own comment says. So the program reached `cross_lane` with
+        // `console_lanes` clear: an assertion in a debug build, and in a
+        // release build a select on whichever lanes the host gave.
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xFA00_0000,
+            0xD501_0000, // v_cndmask_b32 v0, s0, s1, s2
+            0x0008_0200,
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            root(RootType::Table, 4, 1),
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }];
+        let r = lower_with(&words, layout, used);
+        assert!(r.is_err(), "a select on an unrecognised mask must be refused");
     }
 
     #[test]
