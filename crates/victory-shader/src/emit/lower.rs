@@ -1282,6 +1282,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -11512,6 +11513,25 @@ mod tests {
             base_register: 0,
             user_data,
             slot,
+        }
+    }
+
+    #[test]
+    fn a_lane_permute_in_compute_takes_console_lanes() {
+        // `v_permlane16_b32` and `v_permlanex16_b32` read another lane of
+        // the host wave by index, so the program needs console lanes: the
+        // index they compute is the host's, and it is the console's lane
+        // only once the threads are relabelled. Compute programs using them
+        // used to reach `cross_lane` with `console_lanes` still clear,
+        // which tripped its assertion in a debug build and, with the
+        // assertion compiled out, read the wrong lanes.
+        // VOP3 `v_permlane16_b32 v0, v0, 0, 0` and the `x16` form.
+        for (name, word) in [
+            ("v_permlane16_b32", 0xD777_0000u32),
+            ("v_permlanex16_b32", 0xD778_0000),
+        ] {
+            let words = [word, 0x0201_0100, S_ENDPGM];
+            assert!(lowers(&words, 0).is_ok(), "{name}");
         }
     }
 
